@@ -1,5 +1,5 @@
 """
-train.py
+traiing.py
 
 Parametric DICE training: minimize eq. (72) over theta
 """
@@ -22,9 +22,9 @@ from make_dataset import make_dataset, make_mu_grid, make_init, sanity_check
 class MLP(nn.Module):
     num_neuron: int     #neurons per layer
     num_layers: int     #depth
+    T: float            #physical end time
     num_out: int = 1    #final dimension of output
-    T: float = 10.0     #physical end time, for input normalization only
-
+    
     def setup(self):
         self.layers = [nn.Dense(features=self.num_neuron) for _ in range(self.num_layers)] #initializes layers with num_hid features
         self.out = nn.Dense(features=self.num_out) #creates final layer that outputs num_out features
@@ -63,18 +63,18 @@ def make_train_step(loss_fn):
         return state.apply_gradients(grads=grads), loss
     return train_step
 
-def train(x_data, t_data, mu_data, key, n_iter=20_000, bs_n=128, bs_t=64, bs_mu=5, width=128, depth=3, T=10.0):
+def train(x_data, t_data, mu_data, key, n_iter=20_000, bs_n=256, bs_t=128, bs_mu=1,  width=128, depth=7, T=10.0, peak_lr=5e-4, final_lr=1e-6):
 
     model = MLP(num_neuron=width, num_layers=depth, T=T)
     s = make_s(model)
-
+ 
     key, init_key = jax.random.split(key)
-    schedule = make_schedule(n_iter)
+    schedule = make_schedule(n_iter, peak_lr, final_lr)
     state = init_state(init_key, model, schedule)
-
+ 
     loss_fn = get_dice_loss(s, x_data, t_data, mu_data, bs_n, bs_t, bs_mu)
     train_step = make_train_step(loss_fn)
-
+ 
     losses = []
     with tqdm(range(n_iter)) as pbar:
         for it in pbar:
@@ -83,46 +83,94 @@ def train(x_data, t_data, mu_data, key, n_iter=20_000, bs_n=128, bs_t=64, bs_mu=
             losses.append(loss)
             if it % 100 == 0:
                 pbar.set_postfix({"loss": float(loss)})
-
+ 
     return state, s, np.array(losses)
 
 ### driver
-if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="parametric DICE training") #NOTE NOMENCLATURE: exp1, exp2, etc..
-    p.add_argument("--tag", type=str, required=True, help="run name, used in output filenames")
-    p.add_argument("--n_iter", type=int, default=2000, help="short run")
-    args = p.parse_args()
-    os.makedirs(args.tag, exist_ok=True)
+EXPERIMENTS = {
+    1: dict(a=[0.05, 0.125, 0.20], omega=[0.0],             d=[0.0]),
+    2: dict(a=[0.05, 0.125, 0.20], omega=[0.0, 0.10, 0.20], d=[0.0]),
+    3: dict(a=[0.05, 0.125, 0.20], omega=[0.0, 0.10, 0.20], d=[0.25, 0.30, 0.35]),
+}
 
-    seed = 0
-    key = jax.random.PRNGKey(seed)
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser(description="parametric DICE training")
+    p.add_argument("--n_iter", type=int, default=20_000)
+    p.add_argument("--tag", type=str)
+    p.add_argument("--exp", type=int)
+    p.add_argument("--seed", type=int, default=0)
+
+    args = p.parse_args()
+
+    #NOTE Network Params
+    width = 128
+    depth = 7
+    bs_n = 256
+    bs_t = 128
+    bs_mu = 1
+    peak_lr = 5e-4
+    final_lr = 1e-6
+ 
+    #NOTE Physical Params
+    sigma = 0.05
+    dt = 0.05
+    n_steps = 200
+    stride = 1
+    spread = 0.1
+    n_particles = 10_000
+    n_x = 10_000
+
+    #Make folder
+    tag = args.tag
+    os.makedirs(tag, exist_ok=True)
+
+    #assign random keys
+    key = jax.random.PRNGKey(args.seed)
     key, k_x0, k_data, k_train = jax.random.split(key, 4)
 
-    #NOTE EXPERIMENT PARAMS
-    a_vals     = jnp.array([0.05, 0.125, 0.20])
-    omega_vals = jnp.array([0.00, 0.10, 0.20])
-    d_vals     = jnp.array([0.25, 0.30, 0.35])
-    mu_data = make_mu_grid(a_vals, omega_vals, d_vals)
+    #choose mu
+    grid = EXPERIMENTS[args.exp]
+    mu_data = make_mu_grid(jnp.array(grid["a"]), jnp.array(grid["omega"]), jnp.array(grid["d"]))
+    n_mu = mu_data.shape[0]
+    if bs_mu > n_mu:
+        raise ValueError(f"bs_mu={bs_mu} > n_mu={n_mu}")
+    if n_x > n_particles:
+        raise ValueError(f"n_x={n_x} > n_particles={n_particles}")
 
-    x0 = make_init(k_x0) #initial values/blob
-    x_data, t_data = make_dataset(mu_data, x0, k_data)
-    n_x=2000 #keep 2000 of 10000 particles per slice #NOTE FOR TIME
+    #total time
+    T_phys = n_steps * dt
+
+    #make initial particles at t=0
+    x0 = make_init(k_x0, n_particles=n_particles, spread=spread)
+    x_data, t_data = make_dataset(mu_data, x0, k_data, sigma=sigma, dt=dt,
+                                  n_steps=n_steps, stride=stride)
     x_data = x_data[:, :, :n_x, :]
     sanity_check(x_data, t_data, mu_data)
-    t_data = t_data / 10.0 #normalize clock to 1.0
-
-    width, depth, T, n_iter, bs_mu = 128, 3, 1.0, args.n_iter, 6
-    #NOTE bs_mu changes per run!
-    state, s, losses = train(x_data, t_data, mu_data, k_train, n_iter=n_iter, bs_n=128, bs_t=64, bs_mu=bs_mu, width=width, depth=depth, T=T) #NOTE change as needed for run time
-
-    with open(f"{args.tag}/params_{args.tag}.msgpack", "wb") as f:
+  
+    gb = x_data.size * 4 / 1e9
+    print(f"{tag}: n_mu={n_mu}  x_data={x_data.shape} ({gb:.2f} GB)  T_phys={T_phys}  sigma={sigma}")
+ 
+    state, s, losses = train(x_data, t_data, mu_data, k_train,
+                             n_iter=args.n_iter, bs_n=bs_n, bs_t=bs_t,
+                             bs_mu=bs_mu, width=width, depth=depth,
+                             T=T_phys, peak_lr=peak_lr, final_lr=final_lr)
+ 
+    with open(f"{tag}/params_{tag}.msgpack", "wb") as f:
         f.write(serialization.to_bytes(state.params))
-    np.save(f"{args.tag}/losses_{args.tag}.npy", losses)
-
-    with open(f"{args.tag}/config_{args.tag}.json", "w") as f:
-        json.dump({"width": width, "depth": depth, "T": T, "seed": seed,
-                   "n_iter": args.n_iter, "n_x": n_x, "bs_mu": bs_mu,
-                   "a_vals": a_vals.tolist(), "omega_vals": omega_vals.tolist(),
-                   "d_vals": d_vals.tolist()}, f, indent=2)
-
-    print(f"saved {args.tag} (width={width}, depth={depth}, T={T}, n_iter={args.n_iter})")
+    np.save(f"{tag}/losses_{tag}.npy", losses)
+ 
+    cfg = {
+        "exp": args.exp, "seed": args.seed,
+        "width": width, "depth": depth, "T": T_phys,
+        "n_iter": args.n_iter, "bs_n": bs_n, "bs_t": bs_t, "bs_mu": bs_mu,
+        "peak_lr": peak_lr, "final_lr": final_lr,
+        "sigma": sigma, "dt": dt, "n_steps": n_steps, "stride": stride,
+        "spread": spread, "n_particles": n_particles, "n_x": n_x,
+        "a_vals": grid["a"], "omega_vals": grid["omega"], "d_vals": grid["d"],
+    }
+    with open(f"{tag}/config_{tag}.json", "w") as f:
+        json.dump(cfg, f, indent=2)
+ 
+    print(f"saved {tag}  (width={args.width}, depth={args.depth}, bs_mu={args.bs_mu}, "
+          f"n_iter={args.n_iter}, final loss={losses[-1]:.6f})")

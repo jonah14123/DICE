@@ -11,9 +11,9 @@ from physics_integration import CENTER, center, drift, dq, euler_maruyama #to ge
 import jax.numpy as jnp
 import jax
 
-def make_init(key: jax.Array, n_particles: int = 10_000, center: jax.Array = CENTER, spread: float = 0.1) -> jax.Array:
+def make_init(key: jax.Array, n_particles: int = 10_000, c0: jax.Array = CENTER, spread: float = 0.1) -> jax.Array:
     #generate symmetric starting data around the true center
-    return center + spread*jax.random.normal(key, (n_particles, 2), dtype=jnp.float32)
+    return c0 + spread*jax.random.normal(key, (n_particles, 2), dtype=jnp.float32)
     
 
 def make_mu_grid(a_vals: jax.Array, omega_vals: jax.Array, d_vals: jax.Array) -> jax.Array:

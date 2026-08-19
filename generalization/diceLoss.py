@@ -81,7 +81,8 @@ def get_dice_loss(_s, x_data, t_data, mu_data, bs_n, bs_t, bs_mu):  #return dice
         key, mu_key = jax.random.split(key)
         i_mus = jax.random.choice(mu_key, n_mu, shape=(bs_mu,), replace=False)
         mu_keys = jax.random.split(key, bs_mu) #one key PER mu
-        loss = jnp.mean(jax.vmap(lambda i_mu, k: dice_loss_mu(params, k, i_mu))(i_mus, mu_keys))
-        return loss
+        #minibatch sum has expectation (bs_mu / n_mu) * L_mu
+        loss = jnp.sum(jax.vmap(lambda i_mu, k: dice_loss_mu(params, k, i_mu))(i_mus, mu_keys))
+        return loss * (n_mu/bs_mu) #when bs_mu == n_mu the factor is 1 and this is the literal eq 72
 
     return dice_loss
