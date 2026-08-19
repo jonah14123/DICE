@@ -1,3 +1,10 @@
+"""
+evaluation.py
+
+Population-level comparison of the learned dynamics against the true dynamics,
+following the measures used in the DICE paper (sections 8.3 - 8.5).
+"""
+
 import argparse
 import json
 import jax
@@ -7,10 +14,15 @@ import numpy as np
 from flax import serialization
 
 from training import MLP, make_s
-from make_dataset import make_dataset, make_mu_grid, make_init
+from make_dataset import make_dataset, make_init
 from physics_integration import center
 
-### load
+from ott.geometry import pointcloud
+from ott.problems.linear import linear_problem
+from ott.solvers.linear import sinkhorn
+
+
+### load a trained run
 def load_run(tag):
     with open(f"{tag}/config_{tag}.json") as f:
         cfg = json.load(f)
@@ -20,174 +32,163 @@ def load_run(tag):
         params = serialization.from_bytes(template, f.read())
     return model, params, cfg
 
-def get_t_scale(cfg): #RESCALE
-    return float(cfg.get("t_scale", 10.0))
 
-### generate with the learned field
+def rebuild_data(cfg, mu_grid, n_x):
+    #reproduce the true SDE data from the config alone, same key order as the driver
+    key = jax.random.PRNGKey(cfg["seed"])
+    key, k_x0, k_data, k_train = jax.random.split(key, 4)
+    x0 = make_init(k_x0, n_particles=cfg["n_particles"], spread=cfg["spread"])[:n_x]
+    x, t = make_dataset(mu_grid, x0, k_data, sigma=cfg["sigma"], dt=cfg["dt"],
+                        n_steps=cfg["n_steps"], stride=cfg["stride"])
+    return x, t, x0
+
+
+### generate with the learned field: probability flow ODE, dX = grad s dt
 def make_generator(s):
-    grad_s = jax.grad(s, argnums=1) #params is arg 0 here, x is arg 1
+    grad_s = jax.grad(s, argnums=1)
 
-    def generate(params, x0, t_grid, mu):
-        #explicit euler on the probability-flow ODE; t_grid must be in NETWORK time
+    @jax.jit
+    def generate(params, x0, t, mu):
         def step(carry, t_next):
             x, t_prev = carry
             dt = t_next - t_prev
             x_new = x + dt * jax.vmap(lambda p: grad_s(params, p, t_prev, mu))(x)
             return (x_new, t_next), x_new
-
-        (_, _), xs = jax.lax.scan(step, (x0, t_grid[0]), t_grid[1:])
-        return jnp.concatenate([x0[None], xs], axis=0) #(K+1, n_x, 2)
+        _, xs = jax.lax.scan(step, (x0, t[0]), t[1:])
+        return jnp.concatenate([x0[None], xs], axis=0)
     return generate
 
-### diagnostics
-def mean_radius(x, mu):
-    #<|p - c(mu)|> at each time, shape (K+1,)
-    return jnp.mean(jnp.linalg.norm(x - center(mu), axis=-1), axis=-1)
 
-def plot_comparison(x_true, x_gen, t_phys, mu, idx, fname):
-    fig, axes = plt.subplots(2, len(idx), figsize=(3.2*len(idx), 6.4), sharex=True, sharey=True)
-    for col, j in enumerate(idx):
-        axes[0, col].scatter(x_true[j,:,0], x_true[j,:,1], s=0.5, alpha=0.3)
-        axes[1, col].scatter(x_gen[j,:,0],  x_gen[j,:,1],  s=0.5, alpha=0.3, color="C1")
-        axes[0, col].set_title(f"t = {t_phys[j]:.1f}")
-        for row in (0, 1):
-            axes[row, col].set_aspect("equal")
-    axes[0,0].set_ylabel("true (SDE)")
-    axes[1,0].set_ylabel("generated (grad s)")
-    fig.suptitle(f"held-out mu = ({mu[0]:.4g}, {mu[1]:.4g}, {mu[2]:.4g})")
-    fig.tight_layout()
-    fig.savefig(fname, dpi=150)
-    print(f"wrote {fname}")
+### (1) moments, sec 8.3 fig 6.  radial analogue of <X^i> for this geometry
+def moments(x, mu, orders=(1, 2, 3)):
+    r = jnp.linalg.norm(x - center(mu), axis=-1)          #(K+1, N)
+    m = jnp.stack([jnp.mean(r**i, axis=-1) for i in orders])
+    sd = jnp.stack([jnp.std(r**i, axis=-1) for i in orders])
+    return m, sd                                          #(n_ord, K+1)
 
-def sample_test(vals, override, key):
-    #uniform in [min, max] of the training grid
-    if override is not None:
-        return float(override)
-    lo, hi = min(vals), max(vals)
-    if lo == hi:
-        return float(lo)
-    return float(jax.random.uniform(key, minval=lo, maxval=hi))
 
-#field and loss tests
-def plot_loss(tag, window=50):
-    #smoothed DICE loss curve; raw curve is jagged from mu-to-mu variation
-    L = np.load(f"{tag}/losses_{tag}.npy")
-    plt.figure(figsize=(6, 4))
-    plt.plot(np.convolve(L, np.ones(window)/window, mode="valid"))
-    plt.xlabel("iteration"); plt.ylabel(f"DICE loss (smoothed, w={window})")
-    plt.title(tag); plt.tight_layout()
-    plt.savefig(f"{tag}/loss_{tag}.png", dpi=150)
-    print(f"wrote {tag}/loss_{tag}.png   (L[0]={L[0]:.5f}  L[-1]={L[-1]:.5f})")
+### (4) kinetic energy, eq (78)
+def kinetic_energy(x, t):
+    d2 = jnp.sum((x[1:] - x[:-1])**2, axis=-1)            #(K, N)
+    return float(jnp.sum(jnp.mean(d2, axis=-1) / (2*(t[1:] - t[:-1]))))
 
-def plot_field(tag, params, s, mu, t_scale, t_net=(0.05, 0.2, 0.5, 0.9)):
-    grad_s = jax.grad(s, argnums=1) #params is arg 0, x is arg 1
-    c = center(mu)
-    r_trough = float(jnp.sqrt(mu[0]))
- 
-    r = jnp.linspace(0.01, 0.8, 200)
-    pts = c + jnp.stack([r, jnp.zeros_like(r)], axis=-1)
-    e_r = jnp.stack([jnp.ones_like(r), jnp.zeros_like(r)], axis=-1) #radial unit vector on +x ray
- 
-    ref = -t_scale * 4*r*(r**2 - mu[0]) #scale reference in normalized-time units
- 
-    plt.figure(figsize=(7, 4.5))
-    print(f"\nfield check: mu = ({mu[0]:.4g}, {mu[1]:.4g}, {mu[2]:.4g})   sqrt(a) = {r_trough:.4f}")
-    for t in t_net:
-        g = jax.vmap(lambda q: grad_s(params, q, t, mu))(pts)
-        g_r = jnp.sum(g * e_r, axis=-1)
-        plt.plot(r, g_r, label=f"grad s_theta, t_net={t}  (t_phys={t*t_scale:.1f})")
-        i0 = jnp.argmin(jnp.abs(g_r))
-        print(f"  t_net={t:4.2f}   max|g_r| = {jnp.max(jnp.abs(g_r)):8.4f}   "
-              f"|g_r| min at r = {r[i0]:.4f}")
- 
-    plt.plot(r, ref, "k--", lw=1, label=f"-{t_scale:g} V'(r)  [scale reference]")
-    plt.axvline(r_trough, color="gray", lw=0.8)
-    plt.axhline(0.0, color="gray", lw=0.8)
-    plt.text(r_trough, plt.ylim()[1]*0.9, r" $\sqrt{a}$", color="gray")
-    plt.xlabel("r = |p - c|"); plt.ylabel("radial component (normalized-time units)")
-    plt.title(f"{tag}:  mu = ({mu[0]:.4g}, {mu[1]:.4g}, {mu[2]:.4g})")
+
+### (3) Sinkhorn divergence, sec 8.5
+def sinkhorn_curve(x_true, x_gen, idx, eps, n_sub, key):
+    def div(a, b):
+        geom = pointcloud.PointCloud(a, b, epsilon=eps)
+        out = sinkhorn.Sinkhorn()(linear_problem.LinearProblem(geom))
+        return float(out.reg_ot_cost)  # type: ignore[arg-type]
+    out = []
+    for j in idx:
+        k1, k2, key = jax.random.split(key, 3)
+        a = jax.random.choice(k1, x_true[j], (n_sub,), replace=False)
+        b = jax.random.choice(k2, x_gen[j],  (n_sub,), replace=False)
+        out.append(float(div(a, b)))
+    return np.array(out)
+
+
+### plots
+def plot_moments(tag, t, m_true, sd_true, m_gen, mu, label):
+    fig, axes = plt.subplots(1, 3, figsize=(11, 3.2))
+    for i, ax in enumerate(axes):
+        ax.plot(t, m_true[i], label="true")
+        ax.fill_between(t, m_true[i] - sd_true[i]/10, m_true[i] + sd_true[i]/10, alpha=0.25)
+        ax.plot(t, m_gen[i], "--", label="DICE")
+        ax.set_xlabel("t"); ax.set_ylabel(f"<r^{i+1}>")
+    axes[0].legend(fontsize=8)
+    fig.suptitle(f"{label}  mu = ({mu[0]:.4g}, {mu[1]:.4g}, {mu[2]:.4g})", fontsize=10)
+    fig.tight_layout(); fig.savefig(f"{tag}/moments_{label}.png", dpi=150); plt.close(fig)
+
+
+def plot_hist(tag, x_true, x_gen, t, idx, mu, label, bins=80):
+    lo = float(jnp.minimum(x_true.min(), x_gen.min()))
+    hi = float(jnp.maximum(x_true.max(), x_gen.max()))
+    rng = [[lo, hi], [lo, hi]]
+    fig, axes = plt.subplots(2, len(idx), figsize=(3*len(idx), 6.2))
+    for c, j in enumerate(idx):
+        for r, X in enumerate((x_true, x_gen)):
+            H, _, _ = np.histogram2d(np.array(X[j][:, 0]), np.array(X[j][:, 1]),
+                                     bins=bins, range=rng)
+            axes[r, c].imshow(H.T, origin="lower", extent=[lo, hi, lo, hi], aspect="equal")
+            axes[r, c].set_xticks([]); axes[r, c].set_yticks([])
+        axes[0, c].set_title(f"t = {float(t[j]):.1f}", fontsize=9)
+    axes[0, 0].set_ylabel("true"); axes[1, 0].set_ylabel("DICE")
+    fig.suptitle(f"{label}  mu = ({mu[0]:.4g}, {mu[1]:.4g}, {mu[2]:.4g})", fontsize=10)
+    fig.tight_layout(); fig.savefig(f"{tag}/hist_{label}.png", dpi=150); plt.close(fig)
+
+
+def plot_sinkhorn(tag, t_sub, curves, labels):
+    plt.figure(figsize=(6, 3.6))
+    for c, l in zip(curves, labels):
+        plt.plot(t_sub, c, marker="o", ms=3, label=l)
+    plt.xlabel("t"); plt.ylabel("Sinkhorn divergence"); plt.yscale("log")
     plt.legend(fontsize=8); plt.tight_layout()
- 
-    fname = f"{tag}/field_{tag}_a{mu[0]:.4g}_w{mu[1]:.4g}_d{mu[2]:.4g}.png"
-    plt.savefig(fname, dpi=150)
-    print(f"  reference max|{t_scale:g} V'| = {jnp.max(jnp.abs(ref)):.4f}")
-    print(f"wrote {fname}")
+    plt.savefig(f"{tag}/sinkhorn_{tag}.png", dpi=150); plt.close()
+
 
 ### driver
-
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--tag", type=str, required=True)
-    p.add_argument("--test_seed", type=int, default=1) #which random test point
-    p.add_argument("--a_test", type=float, default=None)
-    p.add_argument("--omega_test", type=float, default=None)
-    p.add_argument("--d_test", type=float, default=None)
-    p.add_argument("--field_a", type=float, default=None,
-                   help="probe the field at a TRAINED a instead of the test point")
-    p.add_argument("--no_sample", action="store_true",
-                   help="skip the ODE sampling check, diagnostics only")
+    p = argparse.ArgumentParser(description="population-level DICE evaluation")
+    p.add_argument("--tag", type=str)
     args = p.parse_args()
 
-    model, params, cfg = load_run(args.tag)
+    #NOTE Evaluation Params
+    n_x = 2000            #particles used for evaluation
+    n_sub = 1000          #particles per Sinkhorn call (cost is O(n^2))
+    eps = 1e-3            #Sinkhorn entropic regularization
+    t_stride = 20         #time subsampling for the Sinkhorn curve
+    n_hist = 4            #snapshot times in the histogram figure
+    seed = 0
+
+    tag = args.tag
+    model, params, cfg = load_run(tag)
     s = make_s(model)
     generate = make_generator(s)
-    t_scale = get_t_scale(cfg)
 
-    #test mu drawn uniformly from the training range of THIS grid
-    k_a, k_w, k_d = jax.random.split(jax.random.PRNGKey(args.test_seed), 3)
-    a_t = sample_test(cfg["a_vals"],     args.a_test,     k_a)
-    w_t = sample_test(cfg["omega_vals"], args.omega_test, k_w)
-    d_t = sample_test(cfg["d_vals"],     args.d_test,     k_d)
-    mu_test = make_mu_grid(jnp.array([a_t]), jnp.array([w_t]), jnp.array([d_t]))
-    mu = mu_test[0]
-    tail = f"a{a_t:.4g}_w{w_t:.4g}_d{d_t:.4g}"
+    mu_train = jnp.array(cfg["mu_train"])
+    mu_test  = jnp.array(cfg["mu_test"])
+    mu_all   = jnp.concatenate([mu_train, mu_test])
+    kind = ["train"]*len(mu_train) + ["test"]*len(mu_test)
 
-    print(f"\nheld-out mu = ({a_t:.4g}, {w_t:.4g}, {d_t:.4g})   sqrt(a) = {jnp.sqrt(mu[0]):.4f}")
-    print(f"t_scale = {t_scale}   nearest trained a = "
-          f"{min(cfg['a_vals'], key=lambda v: abs(v - a_t)):.4g}")
+    x_true_all, t, x0 = rebuild_data(cfg, mu_all, n_x)
+    idx_s = list(range(0, len(t), t_stride))
+    idx_h = list(np.linspace(0, len(t)-1, n_hist).astype(int))
+    key = jax.random.PRNGKey(seed)
 
-    ### 1. loss curve -- did it converge?
-    plot_loss(args.tag)
+    print(f"{tag}: {len(mu_train)} train mu, {len(mu_test)} test mu, "
+          f"n_x={n_x}, T={float(t[-1])}")
+    print(f"{'kind':6s} {'a':>7s} {'omega':>7s} {'d':>7s} "
+          f"{'sinkhorn':>10s} {'Ekin true':>10s} {'Ekin DICE':>10s}")
 
-    ### 2. field check -- is grad s_theta the right shape and magnitude?
-    #    default to a TRAINED mu so a bad result cannot be blamed on generalization
-    if args.field_a is not None:
-        mu_field = make_mu_grid(jnp.array([args.field_a]),
-                                jnp.array([cfg["omega_vals"][0]]),
-                                jnp.array([cfg["d_vals"][0]]))[0]
-    else:
-        mu_field = mu
-    plot_field(args.tag, params, s, mu_field, t_scale)
+    curves, labels, rows = [], [], []
+    for i, mu in enumerate(mu_all):
+        x_true = x_true_all[i]
+        x_gen = generate(params, x0, t, mu)
 
-    ### 3. sampling check -- does the learned field transport the population?
-    if not args.no_sample:
-        key = jax.random.PRNGKey(cfg["seed"])
-        key, k_x0, k_data, k_train = jax.random.split(key, 4)
-        n_x = cfg["n_x"]
-        x0 = make_init(k_x0)[:n_x] #match the training particle count
+        key, k_s = jax.random.split(key)
+        sk = sinkhorn_curve(x_true, x_gen, idx_s, eps, n_sub, k_s)
+        e_true, e_gen = kinetic_energy(x_true, t), kinetic_energy(x_gen, t)
+        rows.append([kind[i], *[float(v) for v in mu], float(sk.mean()), e_true, e_gen])
+        print(f"{kind[i]:6s} {mu[0]:7.4f} {mu[1]:7.4f} {mu[2]:7.4f} "
+              f"{sk.mean():10.5f} {e_true:10.3f} {e_gen:10.3f}")
 
-        #physics is unchanged: make_dataset returns PHYSICAL time
-        x_true, t_phys = make_dataset(mu_test, x0, k_data)
-        x_true = x_true[0] #(K+1, n_x, 2)
+        #figures for the first mu of each kind only
+        if i == 0 or i == len(mu_train):
+            label = f"{tag}_{kind[i]}"
+            m_true, sd_true = moments(x_true, mu)
+            m_gen, _ = moments(x_gen, mu)
+            plot_moments(tag, t, m_true, sd_true, m_gen, mu, label)
+            plot_hist(tag, x_true, x_gen, t, idx_h, mu, label)
+            curves.append(sk); labels.append(label)
 
-        #the network lives on the normalized clock, so integrate there
-        t_net = t_phys / t_scale
-        x_gen = generate(params, x0, t_net, mu)
+    plot_sinkhorn(tag, [float(t[j]) for j in idx_s], curves, labels)
 
-        r_true, r_gen = mean_radius(x_true, mu), mean_radius(x_gen, mu)
-        print(f"\nmean radius (physical t in [0, {float(t_phys[-1]):.3g}])")
-        for j in [0, len(t_phys)//4, len(t_phys)//2, -1]:
-            print(f"  t={t_phys[j]:5.2f}   true {r_true[j]:.4f}   gen {r_gen[j]:.4f}   "
-                  f"err {abs(r_true[j]-r_gen[j]):.4f}")
+    with open(f"{tag}/eval_{tag}.json", "w") as f:
+        json.dump({"n_x": n_x, "n_sub": n_sub, "eps": eps, "rows": rows}, f, indent=2)
 
-        idx = [0, len(t_phys)//3, 2*len(t_phys)//3, len(t_phys)-1]
-        plot_comparison(x_true, x_gen, t_phys, mu, idx,
-                        f"{args.tag}/compare_{args.tag}_{tail}.png")
-
-        plt.figure(figsize=(5,3.5))
-        plt.plot(t_phys, r_true, label="true")
-        plt.plot(t_phys, r_gen, "--", label="generated")
-        plt.axhline(float(jnp.sqrt(mu[0])), color="k", lw=0.5, label="sqrt(a)")
-        plt.xlabel("physical t"); plt.ylabel("<|p - c|>"); plt.legend(); plt.tight_layout()
-        plt.savefig(f"{args.tag}/radius_{args.tag}_{tail}.png", dpi=150)
-        print(f"wrote {args.tag}/radius_{args.tag}_{tail}.png")
+    tr = [r[4] for r in rows if r[0] == "train"]
+    te = [r[4] for r in rows if r[0] == "test"]
+    print(f"\nmean Sinkhorn   train {np.mean(tr):.5f}   test {np.mean(te):.5f}")
+    print(f"wrote {tag}/moments_*.png  {tag}/hist_*.png  "
+          f"{tag}/sinkhorn_{tag}.png  {tag}/eval_{tag}.json")
