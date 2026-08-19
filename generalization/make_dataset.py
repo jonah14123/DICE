@@ -1,7 +1,7 @@
 """
 This script imports the physics and numerical approximation for integration from physics_intgration.py, and creates a dataset
 
-make_dataset(physics parameters, initial position, random_key, integration params, resolution, shuffle=yes) -> pupulation samples at resolution over T
+make_dataset(physics parameters, initial position, random_key, integration params, resolution) -> pupulation samples at resolution over T
 
 *NOTE we vary the rotational component by moving the well, NOT C, hence x0 is generated about C
 
@@ -25,7 +25,6 @@ def make_mu_grid(a_vals: jax.Array, omega_vals: jax.Array, d_vals: jax.Array) ->
 
 def make_dataset(mu_grid: jax.Array, x0: jax.Array, key: jax.Array, sigma: float = 0.05, dt: float = 0.05, n_steps: int = 200, stride: int = 1):
     #mu_grid is the physical parameters for each dataset, x0 is the initial values, sigma, dt, n_steps are all for integration and stride is observation spacing
-    #shuffle is on for all training - used for diagnostics
     #output is X = (N_mu, K+1, n_particles, 2) and t = (K+1,)
 
     keys = jax.random.split(key, mu_grid.shape[0]) #one key per mu
@@ -33,7 +32,7 @@ def make_dataset(mu_grid: jax.Array, x0: jax.Array, key: jax.Array, sigma: float
     def run_one(mu, k):
         k_int, k_shuf = jax.random.split(k) #keys for mu - two rands
         traj = euler_maruyama(lambda p: drift(p, mu), x0, k_int, sigma, dt, n_steps)
-        traj = traj[::stride] #subsample in time before shuffle
+        traj = traj[::stride] #subsample in time
         return traj #returns POPULATION trajectory (each column is the population at stride but no indexing by particle)
 
     X = jax.vmap(run_one)(mu_grid, keys) #apply run to each set of parameters, mu
